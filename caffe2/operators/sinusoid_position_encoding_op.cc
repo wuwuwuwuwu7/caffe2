@@ -1,3 +1,19 @@
+/**
+ * Copyright (c) 2016-present, Facebook, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "caffe2/operators/sinusoid_position_encoding_op.h"
 
 namespace caffe2 {
@@ -15,6 +31,7 @@ in https://arxiv.org/abs/1706.03762. Takes a 2-D tensor
 as an argument, and outputs a position encoding tensor of
 size (M x K x embedding_size). Here M is typically the max
 sequence length and K is typically the batch size.
+The input tensor must satisfy input[m, 0] == input[m, k] for all k.
 
 Encoded as amplitude * SIN(pos/alpha^(i/embedding_size)) if i is even,
 else amplitude * COS(pos/alpha^(i/embedding_size)). Here, pos is the position,

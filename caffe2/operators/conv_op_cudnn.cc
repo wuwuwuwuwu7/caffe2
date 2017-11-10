@@ -1,5 +1,21 @@
-#include "caffe2/core/common_cudnn.h"
+/**
+ * Copyright (c) 2016-present, Facebook, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "caffe2/core/context_gpu.h"
+#include "caffe2/core/cudnn_wrappers.h"
 #include "caffe2/operators/conv_op.h"
 #include "caffe2/operators/conv_op_cache_cudnn.h"
 #include "caffe2/operators/conv_pool_op_base.h"
@@ -137,7 +153,11 @@ class CudnnConvOpBase : public ConvPoolOpBase<CUDAContext> {
               desc_,
               cudnnTypeWrapper<T>::type,
               N,
+#if CUDNN_VERSION_MIN(7,0,0)
+              C,
+#else
               C / group_,
+#endif
               H,
               W,
               H * W * C,
@@ -145,7 +165,9 @@ class CudnnConvOpBase : public ConvPoolOpBase<CUDAContext> {
               W * C,
               C));
         } else {
+#if !CUDNN_VERSION_MIN(7,0,0)
           C = C / group_;
+#endif
           vector<int> dims = {N, H, W, D, C};
           vector<int> strides = {H * W * D * C, W * D * C, D * C, C, 1};
           CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
@@ -162,7 +184,11 @@ class CudnnConvOpBase : public ConvPoolOpBase<CUDAContext> {
               desc_,
               cudnnTypeWrapper<T>::type,
               N,
+#if CUDNN_VERSION_MIN(7,0,0)
+              C,
+#else
               C / group_,
+#endif
               H,
               W,
               C * H * W,
@@ -170,7 +196,9 @@ class CudnnConvOpBase : public ConvPoolOpBase<CUDAContext> {
               W,
               1));
         } else {
+#if !CUDNN_VERSION_MIN(7,0,0)
           C = C / group_;
+#endif
           vector<int> dims = {N, C, H, W, D};
           vector<int> strides = {C * H * W * D, H * W * D, W * D, D, 1};
           CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
@@ -341,15 +369,21 @@ bool CudnnConvOp::DoRunWithType() {
             filter_desc_,
             cudnnTypeWrapper<T_W>::type,
             GetCudnnTensorFormat(order_),
+#if CUDNN_VERSION_MIN(7,0,0)
+            M,
+#else
             M / group_,
+#endif
             C / group_,
             kernel_h(),
             kernel_w()));
       } else {
         vector<int> dims(filter.dims().begin(), filter.dims().end());
         dims[0] /= group_;
+#if !CUDNN_VERSION_MIN(7,0,0)
         order_ == StorageOrder::NCHW ? dims[1] /= group_
                                      : dims[filter.ndim() - 1] /= group_;
+#endif
         dims[filter.ndim() - 1] /= group_;
         CUDNN_ENFORCE(cudnnSetFilterNdDescriptor(
             filter_desc_,
@@ -398,7 +432,7 @@ bool CudnnConvOp::DoRunWithType() {
       vector<int> dims = {N, M, H_out, W_out, D_out};
       vector<int> strides = {M * H_out * W_out * D_out,
                              H_out * W_out * D_out,
-                             H_out * D_out,
+                             W_out * D_out,
                              D_out,
                              1};
       CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
@@ -462,6 +496,9 @@ bool CudnnConvOp::DoRunWithType() {
       CUDNN_ENFORCE(cudnnSetConvolutionMathType(
             conv_desc_, CUDNN_TENSOR_OP_MATH));
     }
+
+    // enable cuDNN conv groups
+    CUDNN_CHECK(cudnnSetConvolutionGroupCount(conv_desc_, group_));
 #endif
 
     if (force_algo_[ALGO_FWD] >= 0) {
@@ -524,7 +561,26 @@ bool CudnnConvOp::DoRunWithType() {
   }
 
   // Now, actually run the computation.
-  // Filter
+  // Run directly through cuDNN if possible
+#if CUDNN_VERSION_MIN(7,0,0)
+  cudnn_wrapper_.with_cudnn_state(cudnn_state_, [&](CuDNNState* state) {
+    CUDNN_ENFORCE(cudnnConvolutionForward(
+        state->cudnn_handle(),
+        cudnnTypeWrapper<T_X>::kOne(),
+        bottom_desc_,
+        X.template data<T_X>(),
+        filter_desc_,
+        filter.template data<T_W>(),
+        conv_desc_,
+        algo_,
+        state->workspace().get(cudnn_ws_nbytes_),
+        cudnn_ws_nbytes_,
+        cudnnTypeWrapper<T_Y>::kZero(),
+        top_desc_,
+        Y->template mutable_data<T_Y>()));
+  });
+#else
+  // otherwise manually run through groups
   for (int i = 0; i < group_; ++i) {
     cudnn_wrapper_.with_cudnn_state(cudnn_state_, [&](CuDNNState* state) {
       CUDNN_ENFORCE(cudnnConvolutionForward(
@@ -543,6 +599,7 @@ bool CudnnConvOp::DoRunWithType() {
           Y->template mutable_data<T_Y>() + i * group_offset_Y));
     });
   }
+#endif
   // Bias
   if (InputSize() == 3) {
     auto& bias = Input(BIAS);
@@ -676,13 +733,19 @@ bool CudnnConvGradientOp::DoRunWithType() {
             filter_desc_,
             cudnnTypeWrapper<T_W>::type,
             GetCudnnTensorFormat(order_),
+#if CUDNN_VERSION_MIN(7,0,0)
+            M,
+#else
             M / group_,
+#endif
             C / group_,
             kernel_h(),
             kernel_w()));
       } else {
         vector<int> dims(filter.dims().begin(), filter.dims().end());
+#if !CUDNN_VERSION_MIN(7,0,0)
         dims[0] /= group_;
+#endif
         order_ == StorageOrder::NCHW ? dims[1] /= group_
                                      : dims[filter.ndim() - 1] /= group_;
         CUDNN_ENFORCE(cudnnSetFilterNdDescriptor(
@@ -732,7 +795,7 @@ bool CudnnConvGradientOp::DoRunWithType() {
       vector<int> dims = {N, M, H_out, W_out, D_out};
       vector<int> strides = {M * H_out * W_out * D_out,
                              H_out * W_out * D_out,
-                             H_out * D_out,
+                             W_out * D_out,
                              D_out,
                              1};
       CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
@@ -796,9 +859,12 @@ bool CudnnConvGradientOp::DoRunWithType() {
       CUDNN_ENFORCE(cudnnSetConvolutionMathType(
             conv_desc_, CUDNN_TENSOR_OP_MATH));
     }
-#endif
-    // Set the workspace
 
+    // set cuDNN groups if appropriate
+    CUDNN_CHECK(cudnnSetConvolutionGroupCount(conv_desc_, group_));
+#endif
+
+    // Set the workspace
     size_t bwd_filter_ws_size, bwd_data_ws_size;
 
     // Choose dW algorithm
@@ -955,6 +1021,43 @@ bool CudnnConvGradientOp::DoRunWithType() {
         dbias->template mutable_data<T_DB>()));
   }
 
+#if CUDNN_VERSION_MIN(7,0,0)
+  cudnn_wrapper_.with_cudnn_state(cudnn_state_, [&](CuDNNState* state) {
+    CUDNN_ENFORCE(cudnnConvolutionBackwardFilter(
+        state->cudnn_handle(),
+        cudnnTypeWrapper<T_X>::kOne(),
+        bottom_desc_,
+        X.template data<T_X>(),
+        top_desc_,
+        dY.template data<T_DY>(),
+        conv_desc_,
+        bwd_filter_algo_,
+        state->workspace().get(cudnn_ws_nbytes_),
+        cudnn_ws_nbytes_,
+        cudnnTypeWrapper<T_DW>::kZero(),
+        filter_desc_,
+        dfilter->template mutable_data<T_DW>()));
+    if (OutputSize() == 3 || (no_bias_ && (OutputSize() == 2))) {
+      // Compute the gradient w.r.t. the input.
+      auto* dX = Output(no_bias_ ? BIAS_OR_INPUT_GRAD : INPUT_GRAD);
+      dX->ResizeLike(X);
+      CUDNN_ENFORCE(cudnnConvolutionBackwardData(
+          state->cudnn_handle(),
+          cudnnTypeWrapper<T_W>::kOne(),
+          filter_desc_,
+          filter.template data<T_W>(),
+          top_desc_,
+          dY.template data<T_DY>(),
+          conv_desc_,
+          bwd_data_algo_,
+          state->workspace().get(cudnn_ws_nbytes_),
+          cudnn_ws_nbytes_,
+          cudnnTypeWrapper<T_DX>::kZero(),
+          bottom_desc_,
+          dX->template mutable_data<T_DX>()));
+    }
+  });
+#else
   for (int i = 0; i < group_; ++i) {
     cudnn_wrapper_.with_cudnn_state(cudnn_state_, [&](CuDNNState* state) {
       CUDNN_ENFORCE(cudnnConvolutionBackwardFilter(
@@ -992,6 +1095,7 @@ bool CudnnConvGradientOp::DoRunWithType() {
       }
     });
   }
+#endif
   return true;
 }
 
@@ -1025,5 +1129,14 @@ bool CudnnConvGradientOp::RunOnDevice() {
 
 REGISTER_CUDNN_OPERATOR(Conv, CudnnConvOp);
 REGISTER_CUDNN_OPERATOR(ConvGradient, CudnnConvGradientOp);
+
+REGISTER_CUDNN_OPERATOR(Conv1D, CudnnConvOp);
+REGISTER_CUDNN_OPERATOR(Conv1DGradient, CudnnConvGradientOp);
+
+REGISTER_CUDNN_OPERATOR(Conv2D, CudnnConvOp);
+REGISTER_CUDNN_OPERATOR(Conv2DGradient, CudnnConvGradientOp);
+
+REGISTER_CUDNN_OPERATOR(Conv3D, CudnnConvOp);
+REGISTER_CUDNN_OPERATOR(Conv3DGradient, CudnnConvGradientOp);
 
 }  // namespace caffe2

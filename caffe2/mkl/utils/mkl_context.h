@@ -1,3 +1,19 @@
+/**
+ * Copyright (c) 2016-present, Facebook, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef CAFFE2_UTILS_MKL_CONTEXT_H_
 #define CAFFE2_UTILS_MKL_CONTEXT_H_
 
@@ -30,6 +46,16 @@ class MKLContext final {
   ~MKLContext() {}
 
   inline void SwitchToDevice(int /*stream_id*/ = 0) {}
+
+  inline void WaitEvent(const Event& ev) {
+    ev.Wait(MKLDNN, this);
+  }
+
+  inline void Record(Event* ev, const char* err_msg = nullptr) const {
+    CAFFE_ENFORCE(ev, "Event must not be null.");
+    ev->Record(MKLDNN, this, err_msg);
+  }
+
   inline void FinishDeviceComputation() {}
 
   inline std::mt19937& RandGenerator() {
@@ -71,6 +97,15 @@ class MKLContext final {
     }
   }
 
+  // By default MKL operators don't have async device parts
+  static bool HasAsyncPartDefault() {
+    return false;
+  }
+
+  static bool SupportsAsyncScheduling() {
+    return false;
+  }
+
  protected:
   // TODO(jiayq): instead of hard-coding a generator, make it more flexible.
   int random_seed_{1701};
@@ -100,7 +135,6 @@ inline void MKLContext::CopyBytes<MKLContext, CPUContext>(
     void* dst) {
   memcpy(dst, src, nbytes);
 }
-
 } // namespace caffe2
 
 #endif // CAFFE2_UTILS_MKL_CONTEXT_H_
